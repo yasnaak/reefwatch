@@ -1,0 +1,22 @@
+[Unit]
+Description=ReefWatch Security Daemon (HIDS)
+After=network.target
+Documentation=https://github.com/OpenClaw/reefwatch
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m reefwatch.daemon --config %h/.openclaw/workspace/skills/reefwatch/scripts/reefwatch_config.yaml
+Restart=on-failure
+RestartSec=10
+User=%i
+Environment=PYTHONUNBUFFERED=1
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.openclaw/logs %t
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

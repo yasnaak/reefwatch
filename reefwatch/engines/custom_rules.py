@@ -1,0 +1,173 @@
+"""
+reefwatch.engines.custom_rules
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Evaluates custom JSON-based detection rules.
+
+Rule JSON format::
+
+    {
+        "id": "rule_id",
+        "name": "Human-readable name",
+        "severity": "HIGH",
+        "source_type": "file_change" | "process" | "network",
+        "conditions": {
+            "field": "value_substring"   // all must match
+        }
+    }
+"""
+
+import json
+import re
+import unicodedata
+from datetime import datetime, timezone
+from pathlib import Path
+
+from reefwatch._common import expand, logger
+
+# Zero-width and invisible Unicode characters used in prompt injection
+_INVISIBLE_RE = re.compile(
+    "[\u200b\u200c\u200d\u2060\ufeff\u00ad\u034f\u061c"
+    "\u180e\u2000-\u200f\u202a-\u202e\u2066-\u2069\ufff9-\ufffb]"
+)
+
+# Prompt poisoning patterns (compiled regex for efficiency)
+_POISON_PATTERNS = [
+    re.compile(r"ignore\s+(?:all\s+)?previous\s+instructions", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\b", re.IGNORECASE),
+    re.compile(r"disregard\s+(?:all|everything)", re.IGNORECASE),
+    re.compile(r"new\s+system\s+prompt", re.IGNORECASE),
+    re.compile(r"\beval\s*\(", re.IGNORECASE),
+    re.compile(r"\bexec\s*\(", re.IGNORECASE),
+    re.compile(r"subprocess\.(?:call|run|Popen)", re.IGNORECASE),
+    re.compile(r"__import__\s*\(", re.IGNORECASE),
+    re.compile(r"(?:forget|override)\s+(?:your|all)\s+(?:rules|instructions)", re.IGNORECASE),
+    re.compile(r"act\s+as\s+(?:if|though)\s+you", re.IGNORECASE),
+]
+
+
+class CustomRulesEngine:
+    """Evaluates custom JSON-based detection rules."""
+
+    def __init__(self, config: dict):
+        custom_cfg = config.get("engines", {}).get("custom", {})
+        self.enabled = custom_cfg.get("enabled", True)
+        self.rules_dir = Path(__file__).parent.parent.parent / custom_cfg.get(
+            "rules_dir", "rules/custom"
+        )
+        self._rules: list[dict] = []
+        if self.enabled:
+            self._load_rules()
+
+    def _load_rules(self):
+        """Load all JSON rule files from rules_dir."""
+        if not self.rules_dir.exists():
+            logger.debug(f"Custom rules dir not found: {self.rules_dir}")
+            return
+        for rule_file in self.rules_dir.glob("**/*.json"):
+            try:
+                with open(rule_file) as f:
+                    rule = json.load(f)
+                if isinstance(rule, list):
+                    self._rules.extend(rule)
+                elif isinstance(rule, dict):
+                    self._rules.append(rule)
+            except Exception as e:
+                logger.warning(f"Failed to load custom rule {rule_file}: {e}")
+        if self._rules:
+            logger.info(f"CustomRulesEngine: loaded {len(self._rules)} rules")
+
+    def evaluate(self, event: dict, source_type: str) -> list[dict]:
+        """Evaluate an event against all loaded custom rules.
+
+        Args:
+            event: Dict with event data (keys depend on source_type).
+            source_type: One of "file_change", "process", "network".
+
+        Returns:
+            List of alert dicts for matching rules.
+        """
+        if not self.enabled:
+            return []
+
+        alerts = []
+        for rule in self._rules:
+            if rule.get("source_type") != source_type:
+                continue
+            conditions = rule.get("conditions", {})
+            if not conditions:
+                continue
+            if self._match(conditions, event):
+                alerts.append(
+                    {
+                        "type": rule.get("name", rule.get("id", "custom_rule")),
+                        "severity": rule.get("severity", "MEDIUM"),
+                        "source": "custom_rules",
+                        "detail": json.dumps(event, default=str)[:500],
+                        "rule": f"custom/{rule.get('id', 'unknown')}",
+                        "time": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+        return alerts
+
+    @staticmethod
+    def _match(conditions: dict, event: dict) -> bool:
+        """Check if all conditions match the event (substring matching)."""
+        for field, pattern in conditions.items():
+            value = str(event.get(field, ""))
+            if str(pattern).lower() not in value.lower():
+                return False
+        return True
+
+    def check_openclaw_integrity(self) -> list[dict]:
+        """Special check: ensure OpenClaw's own config hasn't been tampered with."""
+        alerts = []
+        critical_files = [
+            expand("~/.openclaw/openclaw.json"),
+            expand("~/.openclaw/workspace/HEARTBEAT.md"),
+            expand("~/.openclaw/workspace/IDENTITY.md"),
+        ]
+        for f in critical_files:
+            if not f.exists():
+                continue
+            try:
+                raw = f.read_text()
+                # Normalize Unicode to detect obfuscation (NFKC collapses lookalikes)
+                content = unicodedata.normalize("NFKC", raw)
+
+                # Check for invisible/zero-width characters (injection vector)
+                invisible = _INVISIBLE_RE.findall(raw)
+                if len(invisible) > 3:
+                    alerts.append(
+                        {
+                            "type": "Suspicious invisible characters detected",
+                            "severity": "HIGH",
+                            "source": "custom_rules",
+                            "detail": (
+                                f"File {f}: {len(invisible)} invisible Unicode "
+                                f"characters found"
+                            ),
+                            "rule": "custom/invisible_chars",
+                            "time": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+
+                # Check for prompt poisoning patterns (regex-based)
+                for pattern in _POISON_PATTERNS:
+                    if pattern.search(content):
+                        alerts.append(
+                            {
+                                "type": "Potential prompt/memory poisoning",
+                                "severity": "CRITICAL",
+                                "source": "custom_rules",
+                                "detail": (
+                                    f"Suspicious content in {f}: "
+                                    f"matches '{pattern.pattern}'"
+                                ),
+                                "rule": "custom/openclaw_integrity",
+                                "time": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+            except Exception as e:
+                logger.debug(f"Error checking {f}: {e}")
+
+        return alerts
