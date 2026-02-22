@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "OpenClaw Contributors" },
+    { name = "Yassin Naeim" },
 ]
 keywords = ["security", "hids", "intrusion-detection", "openclaw"]
 classifiers = [
@@ -43,9 +43,9 @@ dev = [
 reefwatch = "reefwatch.daemon:main"
 
 [project.urls]
-Homepage = "https://github.com/openclaw/reefwatch"
-Repository = "https://github.com/openclaw/reefwatch"
-Issues = "https://github.com/openclaw/reefwatch/issues"
+Homepage = "https://github.com/yasnaak/reefwatch"
+Repository = "https://github.com/yasnaak/reefwatch"
+Issues = "https://github.com/yasnaak/reefwatch/issues"
 
 [tool.setuptools.packages.find]
 include = ["reefwatch*"]
