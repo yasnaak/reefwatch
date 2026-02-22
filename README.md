@@ -1,7 +1,10 @@
-# ReefWatch
-By Yassin Naeim X: @yasnaeim
+<p align="center">
+  <img src="reefwatch.png" alt="ReefWatch Logo" width="400">
+</p>
 
-**Continuous local security monitoring for OpenClaw hosts.**
+<h1 align="center">ReefWatch</h1>
+<p align="center">By Yassin Naeim · X: <a href="https://x.com/yasnaeim">@yasnaeim</a></p>
+<p align="center"><strong>Continuous local security monitoring for OpenClaw hosts.</strong></p>
 
 ReefWatch is an OpenClaw skill that turns your assistant into a lightweight host-based intrusion detection system (HIDS). It runs as a background daemon, monitors your local machine for threats, and only alerts you through OpenClaw when something suspicious is found.
 
