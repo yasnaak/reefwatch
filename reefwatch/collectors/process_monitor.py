@@ -4,7 +4,6 @@ reefwatch.collectors.process_monitor
 Monitors running processes for suspicious activity.
 """
 
-import threading
 import time
 from datetime import datetime, timezone
 
@@ -24,7 +23,17 @@ class ProcessMonitor:
         self.cpu_threshold = proc_cfg.get("cpu_threshold_percent", 90)
         self.cpu_sustained = proc_cfg.get("cpu_sustained_seconds", 120)
         self._high_cpu_pids: dict[int, float] = {}  # pid -> first_seen_high
-        self._cpu_lock = threading.Lock()
+        self._max_high_cpu_pids = 10_000  # Cap to prevent unbounded growth
+
+        # Prime psutil CPU counters so first check() returns real values
+        # (cpu_percent needs 2 measurements to calculate a delta)
+        if self.enabled:
+            try:
+                for _ in psutil.process_iter(["cpu_percent"]):
+                    pass
+            except Exception:
+                pass
+
         logger.info(
             f"ProcessMonitor initialized: {len(self.suspicious_patterns)} patterns"
         )
@@ -81,9 +90,13 @@ class ProcessMonitor:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        # Cleanup dead PIDs
-        with self._cpu_lock:
-            self._high_cpu_pids = {
-                k: v for k, v in self._high_cpu_pids.items() if k in seen_pids
-            }
+        # Cleanup dead PIDs and enforce cap
+        self._high_cpu_pids = {
+            k: v for k, v in self._high_cpu_pids.items() if k in seen_pids
+        }
+        if len(self._high_cpu_pids) > self._max_high_cpu_pids:
+            # Evict oldest entries
+            sorted_pids = sorted(self._high_cpu_pids, key=self._high_cpu_pids.get)
+            for pid in sorted_pids[: len(self._high_cpu_pids) - self._max_high_cpu_pids]:
+                del self._high_cpu_pids[pid]
         return alerts

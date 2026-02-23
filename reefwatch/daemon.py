@@ -10,6 +10,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,8 @@ from reefwatch.engines.yara_engine import YaraEngine
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-RUNNING = True
+RUNNING = threading.Event()
+RUNNING.set()  # Start in "running" state; clear() to signal shutdown
 
 
 # ---------------------------------------------------------------------------
@@ -74,20 +76,31 @@ class ReefWatchDaemon:
         self._alerts_sent = 0
         self._status_file = Path(
             config.get("general", {}).get(
-                "status_file", "/tmp/reefwatch_status.json"
+                "status_file", "~/.openclaw/reefwatch_status.json"
             )
-        )
+        ).expanduser()
+
+        # Pre-expand critical paths once at init (resolves ~ properly)
+        home = str(Path.home())
+        self._critical_paths = [
+            "/etc/passwd",
+            "/etc/shadow",
+            "/etc/sudoers",
+            "/etc/crontab",
+            "/etc/hosts",
+            f"{home}/.openclaw/openclaw.json",
+            f"{home}/.ssh/authorized_keys",
+        ]
 
         logger.info("ReefWatch daemon initialized")
         logger.info(f"OS: {SYSTEM} ({get_os_key()})")
 
     def run(self):
         """Main monitoring loop."""
-        global RUNNING
         logger.info("ReefWatch monitoring started")
 
         cycle = 0
-        while RUNNING:
+        while RUNNING.is_set():
             try:
                 self._cycle(cycle)
                 cycle += 1
@@ -101,12 +114,13 @@ class ReefWatchDaemon:
                 time.sleep(5)  # Back off on errors
 
         self.alert_mgr.shutdown()
+        self.network_monitor.shutdown()
         logger.info("ReefWatch monitoring stopped")
 
     def _submit(self, alert: dict):
-        """Submit alert and track count."""
-        self.alert_mgr.submit(alert)
-        self._alerts_sent += 1
+        """Submit alert and track count (only if accepted)."""
+        if self.alert_mgr.submit(alert):
+            self._alerts_sent += 1
 
     def _cycle(self, cycle: int):
         """Single monitoring cycle."""
@@ -124,8 +138,8 @@ class ReefWatchDaemon:
         if self.file_watcher.enabled:
             changes = self.file_watcher.check_changes()
             for change in changes:
-                # YARA scan changed files (respecting scan_extensions)
-                if self.yara_engine.enabled and change["type"] in (
+                # YARA scan changed files (only in realtime/on_change mode)
+                if self.yara_engine.enabled and self.yara_engine.mode != "scheduled" and change["type"] in (
                     "file_created",
                     "file_modified",
                     "file_integrity_violation",
@@ -155,17 +169,9 @@ class ReefWatchDaemon:
                     )
 
                 # Alert on critical file changes
-                critical_paths = [
-                    "/etc/passwd",
-                    "/etc/shadow",
-                    "/etc/sudoers",
-                    "/etc/crontab",
-                    "/etc/hosts",
-                    ".openclaw/openclaw.json",
-                    ".ssh/authorized_keys",
-                ]
-                for cp in critical_paths:
-                    if cp in change.get("path", ""):
+                for cp in self._critical_paths:
+                    changed_path = change.get("path", "")
+                    if changed_path == cp:
                         self._submit(
                             {
                                 "type": f"Critical file {change['type']}",
@@ -240,21 +246,24 @@ class ReefWatchDaemon:
             },
         }
         try:
+            self._status_file.parent.mkdir(parents=True, exist_ok=True)
             data = json.dumps(status, indent=2)
-            fd = os.open(str(self._status_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(str(self._status_file), flags, 0o600)
             os.write(fd, data.encode())
             os.close(fd)
         except Exception as e:
-            logger.debug(f"Failed to write status file: {e}")
+            logger.warning(f"Failed to write status file: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def signal_handler(sig, frame):
-    global RUNNING
     logger.info(f"Received signal {sig}, shutting down...")
-    RUNNING = False
+    RUNNING.clear()
 
 
 def main():
@@ -265,37 +274,42 @@ def main():
         help="Path to config file",
     )
     parser.add_argument("--webhook-url", help="OpenClaw webhook URL")
-    parser.add_argument("--webhook-token", help="Webhook auth token")
-    parser.add_argument("--log-level", default="INFO", help="Log level")
+    parser.add_argument("--log-level", default=None, help="Log level")
     args = parser.parse_args()
 
-    # Setup logging
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
-    log_file = expand("~/.openclaw/logs/reefwatch.log")
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # Load and validate config
+    # Load and validate config (must happen before logging setup to read config values)
     config = load_config(args.config)
     for warning in validate_config(config):
         logger.warning(f"Config: {warning}")
     general_cfg = config.get("general", {})
+
+    # Setup logging — CLI --log-level overrides config, config overrides default "INFO"
+    effective_level = args.log_level or general_cfg.get("log_level", "INFO")
+    log_level = getattr(logging, effective_level.upper(), logging.INFO)
+    log_file = expand(general_cfg.get("log_file", "~/.openclaw/logs/reefwatch.log"))
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     log_max_bytes = general_cfg.get("log_max_bytes", 10 * 1024 * 1024)  # 10 MB
     log_backup_count = general_cfg.get("log_backup_count", 5)
 
     from logging.handlers import RotatingFileHandler
 
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            RotatingFileHandler(
-                str(log_file),
-                maxBytes=log_max_bytes,
-                backupCount=log_backup_count,
-            ),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    # Restrict log file permissions (umask 0o077 → files created with 0o600)
+    old_umask = os.umask(0o077)
+    try:
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            handlers=[
+                RotatingFileHandler(
+                    str(log_file),
+                    maxBytes=log_max_bytes,
+                    backupCount=log_backup_count,
+                ),
+                logging.StreamHandler(sys.stdout),
+            ],
+        )
+    finally:
+        os.umask(old_umask)
 
     # Resolve webhook
     webhook_url = (
@@ -304,14 +318,17 @@ def main():
         or config.get("webhook", {}).get("url", "http://127.0.0.1:18789/hooks/wake")
     )
     webhook_token = (
-        args.webhook_token
-        or os.environ.get("OPENCLAW_HOOKS_TOKEN", "")
+        os.environ.get("OPENCLAW_HOOKS_TOKEN", "")
         or config.get("webhook", {}).get("token", "")
     )
 
-    # Write PID (restricted permissions to prevent tampering)
-    pid_file = expand(config.get("general", {}).get("pid_file", "/tmp/reefwatch.pid"))
-    fd = os.open(str(pid_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Write PID (restricted permissions, no symlink following)
+    pid_file = expand(config.get("general", {}).get("pid_file", "~/.openclaw/reefwatch.pid"))
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        pid_flags |= os.O_NOFOLLOW
+    fd = os.open(str(pid_file), pid_flags, 0o600)
     os.write(fd, str(os.getpid()).encode())
     os.close(fd)
 
@@ -323,5 +340,6 @@ def main():
     daemon = ReefWatchDaemon(config, webhook_url, webhook_token)
     daemon.run()
 
-    # Cleanup
-    pid_file.unlink(missing_ok=True)
+    # Cleanup — only unlink if it's a regular file (not a symlink)
+    if pid_file.exists() and not pid_file.is_symlink():
+        pid_file.unlink(missing_ok=True)

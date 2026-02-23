@@ -21,6 +21,7 @@ YARA_SOURCES = [
         "name": "signature-base",
         "description": "Florian Roth's signature base (webshells, exploits, malware)",
         "url": "https://github.com/Neo23x0/signature-base.git",
+        "tag": "v1.2",  # Pin to known-good release tag
         "paths": [
             "yara/gen_webshells.yar",
             "yara/gen_webshells_ext_vars.yar",
@@ -41,6 +42,7 @@ YARA_SOURCES = [
         "name": "yara-rules-community",
         "description": "YARA community rules",
         "url": "https://github.com/Yara-Rules/rules.git",
+        "tag": "20240726",  # Pin to known-good release tag
         "paths": [
             "malware/RANSOM_WannaCry.yar",
             "malware/MALW_Eicar.yar",
@@ -55,6 +57,7 @@ SIGMA_SOURCES = [
         "name": "sigma-rules",
         "description": "SigmaHQ official rules",
         "url": "https://github.com/SigmaHQ/sigma.git",
+        "tag": "r2024-11-25",  # Pin to known-good release tag
         "paths": [
             # Linux authentication & brute force
             "rules/linux/auditd/lnx_auditd_susp_cmds.yml",
@@ -95,6 +98,15 @@ INITIAL_IOC_BLOCKLIST = """# ReefWatch IOC Blocklist
 """
 
 
+def _write_restricted(path: Path, content: str):
+    """Write a file with 0o600 permissions (owner-only read/write)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+
+
 def run_cmd(cmd: list[str], cwd: str = None) -> bool:
     try:
         subprocess.run(
@@ -120,10 +132,13 @@ def download_rules(sources: list[dict], target_dir: Path, rule_type: str):
         print(f"   {source['description']}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Shallow clone
-            if not run_cmd(
-                ["git", "clone", "--depth=1", "--single-branch", source["url"], tmpdir]
-            ):
+            # Shallow clone pinned to tag/branch for reproducibility
+            clone_cmd = ["git", "clone", "--depth=1", "--single-branch"]
+            tag = source.get("tag")
+            if tag:
+                clone_cmd += ["--branch", tag]
+            clone_cmd += [source["url"], tmpdir]
+            if not run_cmd(clone_cmd):
                 print(f"  ❌ Failed to clone {source['name']}, skipping")
                 continue
 
@@ -167,13 +182,13 @@ def setup_custom_rules():
 
     ioc_file = custom_dir / "ioc_blocklist.txt"
     if not ioc_file.exists():
-        ioc_file.write_text(INITIAL_IOC_BLOCKLIST)
+        _write_restricted(ioc_file, INITIAL_IOC_BLOCKLIST)
         print("  ✅ Created IOC blocklist template")
 
     # Create a basic brute-force sigma rule specific to OpenClaw hosts
     openclaw_rules = custom_dir / "openclaw_specific.yml"
     if not openclaw_rules.exists():
-        openclaw_rules.write_text(
+        _write_restricted(openclaw_rules,
             """title: OpenClaw Configuration Tampering
 id: reef-001
 status: stable
@@ -280,7 +295,30 @@ logsource:
   product: linux
 """
         )
-        print("  ✅ Created OpenClaw-specific detection rules")
+        print("  ✅ Created OpenClaw-specific detection rules (Sigma format)")
+
+    # Create sample JSON rules for CustomRulesEngine
+    json_rule_file = custom_dir / "suspicious_file_changes.json"
+    if not json_rule_file.exists():
+        import json
+        sample_rules = [
+            {
+                "name": "Suspicious script in /tmp",
+                "description": "Detects script files created or modified in /tmp",
+                "source_type": "file_change",
+                "conditions": {"path": "/tmp/"},
+                "severity": "HIGH",
+            },
+            {
+                "name": "SSH key modification",
+                "description": "Detects changes to SSH authorized_keys",
+                "source_type": "file_change",
+                "conditions": {"path": "authorized_keys"},
+                "severity": "CRITICAL",
+            },
+        ]
+        _write_restricted(json_rule_file, json.dumps(sample_rules, indent=2))
+        print("  ✅ Created sample custom rules (JSON format)")
 
 
 def create_sample_yara_rules():
@@ -439,7 +477,10 @@ def main():
     sigma_count = len(list((RULES_DIR / "sigma").rglob("*.yml"))) + len(
         list((RULES_DIR / "sigma").rglob("*.yaml"))
     )
-    custom_count = len(list((RULES_DIR / "custom").rglob("*.yml")))
+    custom_count = (
+        len(list((RULES_DIR / "custom").rglob("*.json")))
+        + len(list((RULES_DIR / "custom").rglob("*.yml")))
+    )
 
     print("\n" + "=" * 40)
     print("✅ Setup complete!")

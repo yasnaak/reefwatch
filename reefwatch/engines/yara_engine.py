@@ -17,10 +17,20 @@ class YaraEngine:
     def __init__(self, config: dict):
         yara_cfg = config.get("engines", {}).get("yara", {})
         self.enabled = yara_cfg.get("enabled", True)
-        self.rules_dir = Path(__file__).parent.parent.parent / yara_cfg.get("rules_dir", "rules/yara")
+        base = Path(__file__).parent.parent.parent
+        raw_rules = yara_cfg.get("rules_dir", "rules/yara")
+        if Path(raw_rules).is_absolute():
+            candidate = Path(raw_rules).resolve()
+        else:
+            candidate = (base / raw_rules).resolve()
+            if not candidate.is_relative_to(base.resolve()):
+                logger.error(f"YARA rules_dir escapes package root: {raw_rules}")
+                self.enabled = False
+                candidate = base / "rules" / "yara"
+        self.rules_dir = candidate
         self.max_file_size = yara_cfg.get("max_file_size_mb", 50) * 1024 * 1024
         self.timeout = yara_cfg.get("timeout_seconds", 30)
-        self.mode = yara_cfg.get("mode", "realtime")  # "realtime" or "scheduled"
+        self.mode = yara_cfg.get("mode", "on_change")  # "on_change" or "scheduled"
         self.scheduled_interval = (
             yara_cfg.get("scheduled_interval_hours", 24) * 3600
         )
@@ -67,7 +77,7 @@ class YaraEngine:
         p = Path(filepath)
 
         try:
-            if not p.exists() or not p.is_file():
+            if p.is_symlink() or not p.exists() or not p.is_file():
                 return []
             if p.stat().st_size > self.max_file_size:
                 return []
@@ -95,6 +105,8 @@ class YaraEngine:
             return False
         return (time.time() - self._last_scheduled_scan) >= self.scheduled_interval
 
+    _MAX_SCAN_FILES = 50_000  # Safety cap for scheduled directory scans
+
     def scan_directory(self, directory: str) -> list[dict]:
         """Run YARA scan on all files in a directory. Used for scheduled scans."""
         if not self.enabled or not self._rules:
@@ -107,9 +119,16 @@ class YaraEngine:
 
         scanned = 0
         for f in d.rglob("*"):
+            if f.is_symlink():
+                continue
             if f.is_file():
                 alerts.extend(self.scan_file(str(f)))
                 scanned += 1
+                if scanned >= self._MAX_SCAN_FILES:
+                    logger.warning(
+                        f"YARA scan cap reached ({self._MAX_SCAN_FILES} files)"
+                    )
+                    break
 
         self._last_scheduled_scan = time.time()
         logger.info(f"YARA scheduled scan: {scanned} files, {len(alerts)} matches")

@@ -244,21 +244,36 @@ class TestShutdown:
 class TestWebhookValidation:
     def test_localhost_accepted(self, sample_config):
         mgr = AlertManager(sample_config, "http://localhost:18789/hooks/wake", "")
-        assert mgr.webhook_url == "http://localhost:18789/hooks/wake"
+        # URL is rewritten with resolved IP (DNS pinning) but stays functional
+        assert mgr.webhook_url != ""
+        assert "/hooks/wake" in mgr.webhook_url
+        assert mgr._webhook_host_header == "localhost"
 
     def test_127_0_0_1_accepted(self, sample_config):
         mgr = AlertManager(sample_config, "http://127.0.0.1:18789/hooks/wake", "")
+        # IP literal stays unchanged (no DNS resolution needed)
         assert mgr.webhook_url == "http://127.0.0.1:18789/hooks/wake"
 
-    def test_external_host_warns_but_keeps(self, sample_config):
+    def test_external_host_blocked_by_default(self, sample_config):
         mgr = AlertManager(sample_config, "http://evil.com:1234/hook", "")
-        # URL is kept (just warns), not disabled
-        assert mgr.webhook_url == "http://evil.com:1234/hook"
+        # External hosts are blocked (URL cleared) unless allow_external is set
+        assert mgr.webhook_url == ""
 
-    def test_external_host_allowed_with_config(self, sample_config):
+    def test_external_host_allowed_with_https(self, sample_config):
+        from unittest.mock import patch
+        sample_config["webhook"]["allow_external"] = True
+        # Mock DNS so test doesn't depend on real resolution
+        with patch("reefwatch.alert_manager.socket.getaddrinfo") as mock_dns:
+            mock_dns.return_value = [(None, None, None, None, ("93.184.216.34",))]
+            mgr = AlertManager(sample_config, "https://remote.host:9999/hook", "")
+        assert mgr.webhook_url != ""
+        assert "/hook" in mgr.webhook_url
+        assert mgr._webhook_host_header == "remote.host"
+
+    def test_external_http_blocked_even_with_allow_external(self, sample_config):
         sample_config["webhook"]["allow_external"] = True
         mgr = AlertManager(sample_config, "http://remote.host:9999/hook", "")
-        assert mgr.webhook_url == "http://remote.host:9999/hook"
+        assert mgr.webhook_url == ""  # HTTP blocked for external hosts
 
     def test_invalid_scheme_disables_webhook(self, sample_config):
         mgr = AlertManager(sample_config, "ftp://localhost/hook", "")

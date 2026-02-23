@@ -19,6 +19,7 @@ def _make_config(tmp_path, sources=None, use_journald=False):
                     "darwin": sources or [str(src_file)],
                 },
                 "use_journald": use_journald,
+                "use_unified_log": False,
             },
         },
     }
@@ -100,17 +101,25 @@ class TestJournald:
         assert entries[0]["unit"] == "sshd.service"
 
     @patch("reefwatch.collectors.log_collector.subprocess.run")
-    def test_first_run_uses_since_now(self, mock_run, tmp_path):
+    def test_first_run_uses_init_timestamp(self, mock_run, tmp_path):
+        from datetime import datetime
         mock_run.return_value = MagicMock(returncode=0, stdout="")
         config = _make_config(tmp_path, use_journald=True)
         lc = LogCollector(config)
         lc.use_journald = True
+        # On Darwin, _last_journald_ts is None; simulate Linux init behavior
+        if lc._last_journald_ts is None:
+            lc._last_journald_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         lc._collect_journald()
         cmd = mock_run.call_args[0][0]
         assert "--since" in cmd
         idx = cmd.index("--since")
-        assert cmd[idx + 1] == "now"
+        # First run uses the timestamp set at init (local time)
+        ts = cmd[idx + 1]
+        assert ts is not None and ts != "now"
+        # Verify it looks like a timestamp (YYYY-MM-DD HH:MM:SS)
+        assert len(ts) == 19 and ts[4] == "-"
 
     @patch("reefwatch.collectors.log_collector.subprocess.run")
     def test_subsequent_run_uses_timestamp(self, mock_run, tmp_path):

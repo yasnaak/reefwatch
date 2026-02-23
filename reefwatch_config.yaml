@@ -5,16 +5,20 @@
 general:
   log_file: "~/.openclaw/logs/reefwatch.log"
   log_level: "INFO"                    # DEBUG, INFO, WARNING, ERROR
-  pid_file: "/tmp/reefwatch.pid"
+  log_max_bytes: 10485760              # 10 MB — max log file size before rotation
+  log_backup_count: 5                  # Number of rotated log files to keep
+  pid_file: "~/.openclaw/reefwatch.pid"
+  status_file: "~/.openclaw/reefwatch_status.json"
   alerts_history: "~/.openclaw/workspace/skills/reefwatch/scripts/alerts_history.json"
   max_alerts_history: 500              # Max alerts to keep in history
 
 # Webhook (OpenClaw integration)
 webhook:
   url: "http://127.0.0.1:18789/hooks/wake"
-  token: ""                            # Set via --webhook-token or OPENCLAW_HOOKS_TOKEN env
+  token: ""                            # Set via OPENCLAW_HOOKS_TOKEN env var (preferred)
   retry_attempts: 3
   retry_delay_seconds: 5
+  allow_external: false                # Set true to allow non-localhost webhooks (HTTPS required)
 
 # Alert deduplication
 alerting:
@@ -39,6 +43,8 @@ collectors:
         - "/var/log/install.log"
     # Also uses journalctl on Linux if available
     use_journald: true
+    # Also uses macOS unified log (log show) on Darwin
+    use_unified_log: true
 
   files:
     enabled: true
@@ -72,6 +78,8 @@ collectors:
       - ".mach-o"
       - ".dmg"
       - ".pkg"
+    # Files smaller than this (KB) get SHA256 integrity checks
+    hash_threshold_kb: 512
 
   processes:
     enabled: true
@@ -111,7 +119,7 @@ engines:
     enabled: true
     rules_dir: "rules/yara/"
     # Scan changed files only (via file watcher) vs full scan
-    mode: "on_change"                  # "on_change" or "scheduled"
+    mode: "on_change"                  # "on_change" (scan changed files) or "scheduled" (full periodic scan)
     scheduled_interval_hours: 24       # If mode=scheduled
     max_file_size_mb: 50               # Skip files larger than this
     timeout_seconds: 30                # Per-file scan timeout
@@ -128,3 +136,4 @@ engines:
   custom:
     enabled: true
     rules_dir: "rules/custom/"
+    integrity_interval_seconds: 300    # OpenClaw integrity check interval

@@ -4,10 +4,15 @@ reefwatch.alert_manager
 Deduplicates, batches, and delivers alerts to OpenClaw webhook.
 """
 
+import ipaddress
 import json
+import os
+import socket
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
@@ -23,17 +28,20 @@ class AlertManager:
         self.webhook_config = config.get("webhook", {})
         self.webhook_url = webhook_url
         self.webhook_token = webhook_token
+        self._webhook_host_header: str = ""  # Original Host for HTTP header
         self._validate_webhook_url()
         self.dedup_window = self.alerting_config.get("dedup_window_seconds", 300)
         self.min_severity = self.alerting_config.get("min_severity", "MEDIUM")
         self.batch_alerts_flag = self.alerting_config.get("batch_alerts", True)
         self.batch_window = self.alerting_config.get("batch_window_seconds", 30)
 
-        self._recent: dict[str, float] = {}  # rule_id -> last_alert_timestamp
+        self._recent: dict[str, float] = {}  # dedup_key -> last_alert_timestamp
+        self._max_dedup_entries = 10_000  # Cap dedup dict to prevent unbounded growth
+        self._dedup_lock = threading.Lock()
         self._batch: list[dict] = []
         self._batch_lock = threading.Lock()
+        self._history_lock = threading.Lock()
         self._batch_timer: threading.Timer | None = None
-        self._history_count: int = 0
 
         self.history_file = expand(
             config.get("general", {}).get(
@@ -43,6 +51,15 @@ class AlertManager:
         )
         self.max_history = config.get("general", {}).get("max_alerts_history", 500)
 
+        # Seed _history_count from existing file so rotation triggers correctly
+        self._history_count: int = 0
+        try:
+            if self.history_file.exists():
+                with open(self.history_file) as f:
+                    self._history_count = sum(1 for _ in f)
+        except Exception:
+            pass
+
         severity_order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
         self._min_sev_idx = (
             severity_order.index(self.min_severity)
@@ -51,8 +68,8 @@ class AlertManager:
         )
         self._severity_order = severity_order
 
-    def submit(self, alert: dict):
-        """Submit an alert for processing. May be deduped or batched."""
+    def submit(self, alert: dict) -> bool:
+        """Submit an alert for processing. Returns True if accepted (not filtered/deduped)."""
         sev = alert.get("severity", "MEDIUM")
         try:
             sev_idx = self._severity_order.index(sev)
@@ -61,19 +78,30 @@ class AlertManager:
             sev_idx = self._severity_order.index("MEDIUM")
         if sev_idx < self._min_sev_idx:
             logger.debug(f"Alert below min severity ({sev}): {alert.get('type')}")
-            return
+            return False
 
-        rule_id = alert.get("rule", "unknown")
+        # Dedup key includes rule + hash of detail to avoid collisions
+        # on long paths sharing a prefix
+        import hashlib
+        detail_hash = hashlib.md5(
+            alert.get("detail", "").encode(), usedforsecurity=False
+        ).hexdigest()[:16]
+        dedup_key = f"{alert.get('rule', 'unknown')}:{detail_hash}"
         now = time.time()
-        if rule_id in self._recent:
-            if now - self._recent[rule_id] < self.dedup_window:
-                logger.debug(f"Dedup: skipping repeat alert for {rule_id}")
-                return
-        self._recent[rule_id] = now
+        with self._dedup_lock:
+            if dedup_key in self._recent:
+                if now - self._recent[dedup_key] < self.dedup_window:
+                    logger.debug(f"Dedup: skipping repeat alert for {dedup_key}")
+                    return False
+            self._recent[dedup_key] = now
 
-        # Clean old dedup entries
-        cutoff = now - self.dedup_window
-        self._recent = {k: v for k, v in self._recent.items() if v > cutoff}
+            # Clean old dedup entries and enforce cap
+            cutoff = now - self.dedup_window
+            self._recent = {k: v for k, v in self._recent.items() if v > cutoff}
+            if len(self._recent) > self._max_dedup_entries:
+                sorted_keys = sorted(self._recent, key=self._recent.get)
+                for k in sorted_keys[: len(self._recent) - self._max_dedup_entries]:
+                    del self._recent[k]
 
         self._save_to_history(alert)
 
@@ -81,6 +109,7 @@ class AlertManager:
             self._add_to_batch(alert)
         else:
             self._send([alert])
+        return True
 
     def _add_to_batch(self, alert: dict):
         with self._batch_lock:
@@ -123,6 +152,8 @@ class AlertManager:
         message = "\n".join(lines)
 
         headers = {"Content-Type": "application/json"}
+        if self._webhook_host_header:
+            headers["Host"] = self._webhook_host_header
         if self.webhook_token:
             headers["Authorization"] = f"Bearer {self.webhook_token}"
 
@@ -156,8 +187,35 @@ class AlertManager:
         if batch:
             self._send(batch)
 
+    @staticmethod
+    def _is_loopback(hostname: str) -> bool:
+        """Check if hostname resolves to a loopback address."""
+        # Fast-path for common names
+        if hostname in ("localhost", "127.0.0.1", "::1"):
+            return True
+        try:
+            addr = ipaddress.ip_address(hostname)
+            return addr.is_loopback
+        except ValueError:
+            pass
+        # Resolve hostname and check all resulting IPs
+        try:
+            for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC):
+                addr = ipaddress.ip_address(info[4][0])
+                if not addr.is_loopback:
+                    return False
+            return True  # All resolved IPs are loopback
+        except (socket.gaierror, OSError):
+            return False
+
     def _validate_webhook_url(self):
-        """Basic SSRF prevention: warn if webhook points outside localhost."""
+        """SSRF prevention: resolve hostname to IP at init time and pin it.
+
+        This prevents DNS rebinding attacks where the hostname resolves to
+        a loopback at validation time but a different IP at send time.
+        The resolved IP is substituted into the URL and the original Host
+        header is preserved for the HTTP request.
+        """
         if not self.webhook_url:
             return
         parsed = urlparse(self.webhook_url)
@@ -167,13 +225,61 @@ class AlertManager:
             )
             self.webhook_url = ""
             return
-        localhost_hosts = {"127.0.0.1", "localhost", "::1"}
+        hostname = parsed.hostname or ""
+        is_local = self._is_loopback(hostname)
         allow_external = self.webhook_config.get("allow_external", False)
-        if parsed.hostname not in localhost_hosts and not allow_external:
-            logger.warning(
-                f"Webhook URL host '{parsed.hostname}' is not localhost. "
-                f"Set webhook.allow_external: true in config to suppress this warning."
+        if not is_local and not allow_external:
+            logger.error(
+                f"Webhook URL host '{hostname}' is not localhost. "
+                f"Refusing to send alerts externally. "
+                f"Set webhook.allow_external: true in config to allow."
             )
+            self.webhook_url = ""
+            return
+        # Require HTTPS for non-loopback targets (when allow_external is true)
+        if not is_local and parsed.scheme != "https":
+            logger.error(
+                f"Webhook URL uses HTTP for external host '{hostname}'. "
+                f"HTTPS is required for external webhooks."
+            )
+            self.webhook_url = ""
+            return
+
+        # Pin the resolved IP to prevent DNS rebinding between validation
+        # and request time (TOCTOU).  For loopback names we resolve to the
+        # canonical 127.0.0.1 so that requests.post() never re-resolves.
+        try:
+            resolved_ip = self._resolve_to_ip(hostname)
+        except OSError:
+            logger.error(f"Cannot resolve webhook hostname '{hostname}', disabling")
+            self.webhook_url = ""
+            return
+
+        if resolved_ip and resolved_ip != hostname:
+            # Rewrite URL to use resolved IP, keep original host for Host header
+            self._webhook_host_header = hostname
+            port = f":{parsed.port}" if parsed.port else ""
+            self.webhook_url = (
+                f"{parsed.scheme}://{resolved_ip}{port}{parsed.path}"
+                + (f"?{parsed.query}" if parsed.query else "")
+            )
+
+    @staticmethod
+    def _resolve_to_ip(hostname: str) -> str:
+        """Resolve a hostname to its first IP address string.
+
+        Returns the IP unchanged if *hostname* is already an IP literal.
+        Raises OSError on DNS failure.
+        """
+        try:
+            ipaddress.ip_address(hostname)
+            return hostname  # Already an IP literal
+        except ValueError:
+            pass
+        infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC)
+        if infos:
+            return infos[0][4][0]
+        return hostname
 
     def _config_retry(self):
         return {
@@ -182,22 +288,43 @@ class AlertManager:
         }
 
     def _save_to_history(self, alert: dict):
-        try:
-            self.history_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.history_file, "a") as f:
-                f.write(json.dumps(alert, default=str) + "\n")
-            self._history_count += 1
-            if self._history_count % 50 == 0:
-                self._rotate_history()
-        except Exception as e:
-            logger.warning(f"Failed to save alert history: {e}")
+        with self._history_lock:
+            try:
+                self.history_file.parent.mkdir(parents=True, exist_ok=True)
+                hist_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                if hasattr(os, "O_NOFOLLOW"):
+                    hist_flags |= os.O_NOFOLLOW
+                fd = os.open(str(self.history_file), hist_flags, 0o600)
+                with os.fdopen(fd, "a") as f:
+                    f.write(json.dumps(alert, default=str) + "\n")
+                self._history_count += 1
+                if self._history_count % 50 == 0:
+                    self._rotate_history_locked()
+            except Exception as e:
+                logger.warning(f"Failed to save alert history: {e}")
 
-    def _rotate_history(self):
-        """Keep only the last max_history alerts in the JSONL file."""
+    def _rotate_history_locked(self):
+        """Keep only the last max_history alerts (caller holds _history_lock)."""
         try:
-            lines = self.history_file.read_text().strip().split("\n")
-            if len(lines) > self.max_history:
-                with open(self.history_file, "w") as f:
-                    f.write("\n".join(lines[-self.max_history :]) + "\n")
+            lines = self.history_file.read_text().strip().splitlines()
+            if len(lines) <= self.max_history:
+                return
+            trimmed = "\n".join(lines[-self.max_history:]) + "\n"
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(self.history_file.parent)
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                os.write(fd, trimmed.encode())
+                os.close(fd)
+                fd = -1
+                os.replace(tmp_path, str(self.history_file))
+                tmp_path = None
+            except Exception:
+                if fd >= 0:
+                    os.close(fd)
+                if tmp_path and Path(tmp_path).exists():
+                    os.unlink(tmp_path)
+                raise
         except Exception as e:
             logger.debug(f"History rotation failed: {e}")

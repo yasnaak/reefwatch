@@ -160,6 +160,7 @@ class TestEvaluateFullRule:
         engine = SigmaEngine.__new__(SigmaEngine)
         engine.enabled = True
         engine.rules_dir = tmp_path
+        engine.log_sources = set()
         engine._rules_data = rules
         return engine
 
@@ -240,3 +241,109 @@ class TestEvaluateFullRule:
         engine = self._make_engine_with_rules([], tmp_path)
         engine.enabled = False
         assert engine.evaluate({"line": "anything"}) == []
+
+
+class TestLogsourceFiltering:
+    """Test logsource category gating."""
+
+    def _make_engine(self, rules, tmp_path, log_sources=None):
+        engine = SigmaEngine.__new__(SigmaEngine)
+        engine.enabled = True
+        engine.rules_dir = tmp_path
+        engine.log_sources = set(log_sources or [])
+        engine._rules_data = rules
+        return engine
+
+    def test_rule_with_matching_category(self, tmp_path):
+        rules = [
+            {
+                "file": "auth.yml",
+                "title": "Auth Rule",
+                "level": "high",
+                "description": "",
+                "detection": {"keywords": ["failed"], "condition": "keywords"},
+                "logsource_category": "auth",
+            }
+        ]
+        engine = self._make_engine(rules, tmp_path, log_sources=["auth", "syslog"])
+        alerts = engine.evaluate({"line": "failed password", "source": "auth.log"})
+        assert len(alerts) == 1
+
+    def test_rule_with_non_matching_category_skipped(self, tmp_path):
+        rules = [
+            {
+                "file": "proc.yml",
+                "title": "Process Rule",
+                "level": "high",
+                "description": "",
+                "detection": {"keywords": ["failed"], "condition": "keywords"},
+                "logsource_category": "process_creation",
+            }
+        ]
+        engine = self._make_engine(rules, tmp_path, log_sources=["auth", "syslog"])
+        # auth.log maps to {"auth", "authentication"}, not "process_creation"
+        alerts = engine.evaluate({"line": "failed password", "source": "auth.log"})
+        assert len(alerts) == 0
+
+    def test_rule_without_category_always_runs(self, tmp_path):
+        rules = [
+            {
+                "file": "generic.yml",
+                "title": "Generic Rule",
+                "level": "medium",
+                "description": "",
+                "detection": {"keywords": ["error"], "condition": "keywords"},
+                "logsource_category": "",
+            }
+        ]
+        engine = self._make_engine(rules, tmp_path, log_sources=["auth"])
+        alerts = engine.evaluate({"line": "error occurred", "source": "auth.log"})
+        assert len(alerts) == 1
+
+    def test_no_log_sources_configured_allows_matching_categories(self, tmp_path):
+        rules = [
+            {
+                "file": "auth.yml",
+                "title": "Auth Rule",
+                "level": "medium",
+                "description": "",
+                "detection": {"keywords": ["test"], "condition": "keywords"},
+                "logsource_category": "auth",
+            }
+        ]
+        engine = self._make_engine(rules, tmp_path, log_sources=[])
+        # No log_sources configured — categories still derived from source
+        alerts = engine.evaluate({"line": "test event", "source": "auth.log"})
+        assert len(alerts) == 1
+
+    def test_unknown_source_runs_all_rules(self, tmp_path):
+        rules = [
+            {
+                "file": "any.yml",
+                "title": "Any Rule",
+                "level": "medium",
+                "description": "",
+                "detection": {"keywords": ["test"], "condition": "keywords"},
+                "logsource_category": "network",
+            }
+        ]
+        engine = self._make_engine(rules, tmp_path, log_sources=[])
+        # Unknown source → entry_cats is empty → rule not skipped
+        alerts = engine.evaluate({"line": "test event", "source": "unknown_source"})
+        assert len(alerts) == 1
+
+    def test_journald_maps_to_multiple_categories(self, tmp_path):
+        rules = [
+            {
+                "file": "auth.yml",
+                "title": "Auth Rule",
+                "level": "high",
+                "description": "",
+                "detection": {"keywords": ["failed"], "condition": "keywords"},
+                "logsource_category": "auth",
+            }
+        ]
+        engine = self._make_engine(rules, tmp_path, log_sources=["auth", "syslog", "process_creation"])
+        # journald maps to {"syslog", "auth", "process_creation"}
+        alerts = engine.evaluate({"line": "failed password", "source": "journald"})
+        assert len(alerts) == 1

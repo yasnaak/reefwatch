@@ -6,7 +6,7 @@ Tails system log files for new entries.
 
 import json
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from reefwatch._common import SYSTEM, expand, get_os_key, logger
 
@@ -29,7 +29,18 @@ class LogCollector:
             config.get("collectors", {}).get("logs", {}).get("use_journald", True)
             and SYSTEM == "Linux"
         )
-        self._last_journald_ts: str | None = None
+        # Pre-set so first cycle captures events since startup
+        # Use local time because journalctl --since interprets timestamps as local
+        self._last_journald_ts: str | None = (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if self.use_journald else None
+        )
+
+        self.use_unified_log = (
+            config.get("collectors", {}).get("logs", {}).get("use_unified_log", True)
+            and SYSTEM == "Darwin"
+        )
+        self._last_unified_ts: str | None = None
 
         # Initialize positions to end of file (only read new lines)
         for src in self.sources:
@@ -39,9 +50,14 @@ class LogCollector:
                 logger.debug(f"Cannot get size of {src}, starting from 0: {e}")
                 self._file_positions[str(src)] = 0
 
+        log_extras = []
+        if self.use_journald:
+            log_extras.append("+journald")
+        if self.use_unified_log:
+            log_extras.append("+unified_log")
         logger.info(
             f"LogCollector initialized: {len(self.sources)} sources"
-            + (" +journald" if self.use_journald else "")
+            + (f" {' '.join(log_extras)}" if log_extras else "")
         )
 
     def collect(self) -> list[dict]:
@@ -51,6 +67,10 @@ class LogCollector:
         # Collect from journald on Linux
         if self.use_journald:
             entries.extend(self._collect_journald())
+
+        # Collect from macOS unified log
+        if self.use_unified_log:
+            entries.extend(self._collect_unified_log())
 
         for src in self.sources:
             try:
@@ -63,10 +83,19 @@ class LogCollector:
                     last_pos = 0
 
                 if current_size > last_pos:
+                    max_read = 10 * 1024 * 1024  # 10 MB cap per cycle
                     with open(src, "r", errors="replace") as f:
                         f.seek(last_pos)
-                        new_lines = f.readlines()
-                        self._file_positions[src_str] = f.tell()
+                        data = f.read(max_read)
+                        actual_pos = f.tell()
+                        # Guard against truncation between stat() and read():
+                        # if we read nothing despite stat() saying there's data,
+                        # the file was likely truncated — reset to current end.
+                        if not data and actual_pos <= last_pos:
+                            self._file_positions[src_str] = 0
+                            continue
+                        self._file_positions[src_str] = actual_pos
+                    new_lines = data.splitlines()
 
                     for line in new_lines:
                         line = line.strip()
@@ -75,7 +104,7 @@ class LogCollector:
                                 {
                                     "source": src.name,
                                     "source_path": src_str,
-                                    "line": line,
+                                    "line": line[:self._MAX_LOG_LINE],
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                 }
                             )
@@ -90,12 +119,10 @@ class LogCollector:
         """Collect new entries from systemd journal."""
         entries = []
         try:
-            cmd = ["journalctl", "--output=json", "--no-pager"]
-            if self._last_journald_ts:
-                cmd += ["--since", self._last_journald_ts]
-            else:
-                # First run: only get entries from now
-                cmd += ["--since", "now"]
+            cmd = [
+                "journalctl", "--output=json", "--no-pager",
+                "--since", self._last_journald_ts,
+            ]
 
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=10
@@ -109,6 +136,14 @@ class LogCollector:
                     continue
                 try:
                     record = json.loads(line)
+                    # Use journal entry's own timestamp if available
+                    rt = record.get("__REALTIME_TIMESTAMP")
+                    if rt:
+                        ts = datetime.fromtimestamp(
+                            int(rt) / 1_000_000, tz=timezone.utc
+                        ).isoformat()
+                    else:
+                        ts = datetime.now(timezone.utc).isoformat()
                     entries.append(
                         {
                             "source": "journald",
@@ -116,16 +151,18 @@ class LogCollector:
                             "line": record.get("MESSAGE", ""),
                             "unit": record.get("_SYSTEMD_UNIT", ""),
                             "priority": record.get("PRIORITY", ""),
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "timestamp": ts,
                         }
                     )
                 except json.JSONDecodeError:
                     continue
 
-            # Update timestamp for next collection
-            self._last_journald_ts = datetime.now(timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            # Update timestamp for next collection (local time for journalctl).
+            # Add 1 second because --since is inclusive — avoids re-processing
+            # the last event from the previous cycle.
+            self._last_journald_ts = (
+                datetime.now() + timedelta(seconds=1)
+            ).strftime("%Y-%m-%d %H:%M:%S")
         except FileNotFoundError:
             logger.debug("journalctl not found, disabling journald collection")
             self.use_journald = False
@@ -133,5 +170,65 @@ class LogCollector:
             logger.warning("journalctl timed out")
         except Exception as e:
             logger.debug(f"journald collection error: {e}")
+
+        return entries
+
+    _MAX_LOG_LINE = 8192  # Truncate individual log lines to prevent OOM
+
+    def _collect_unified_log(self) -> list[dict]:
+        """Collect new entries from macOS unified log via ``log show``."""
+        entries = []
+        try:
+            cmd = [
+                "log", "show", "--style", "ndjson",
+                "--predicate", "eventType == logEvent",
+                "--last", f"{self.interval}s",
+            ]
+            if self._last_unified_ts:
+                cmd = [
+                    "log", "show", "--style", "ndjson",
+                    "--predicate", "eventType == logEvent",
+                    "--start", self._last_unified_ts,
+                ]
+
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                logger.debug(f"log show returned {result.returncode}")
+                return entries
+
+            for raw_line in result.stdout.strip().split("\n"):
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                ts = record.get("timestamp", datetime.now(timezone.utc).isoformat())
+                msg = record.get("eventMessage", "")
+                if not msg:
+                    continue
+                entries.append(
+                    {
+                        "source": "unified_log",
+                        "source_path": "unified_log",
+                        "line": msg[:self._MAX_LOG_LINE],
+                        "process": record.get("processImagePath", ""),
+                        "subsystem": record.get("subsystem", ""),
+                        "category": record.get("category", ""),
+                        "timestamp": ts,
+                    }
+                )
+
+            # Format compatible with `log show --start` (local time, no tz)
+            self._last_unified_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        except FileNotFoundError:
+            logger.debug("log command not found, disabling unified log collection")
+            self.use_unified_log = False
+        except subprocess.TimeoutExpired:
+            logger.warning("log show timed out")
+        except Exception as e:
+            logger.debug(f"unified log collection error: {e}")
 
         return entries

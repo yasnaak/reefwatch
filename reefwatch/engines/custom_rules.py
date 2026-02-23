@@ -51,9 +51,17 @@ class CustomRulesEngine:
     def __init__(self, config: dict):
         custom_cfg = config.get("engines", {}).get("custom", {})
         self.enabled = custom_cfg.get("enabled", True)
-        self.rules_dir = Path(__file__).parent.parent.parent / custom_cfg.get(
-            "rules_dir", "rules/custom"
-        )
+        base = Path(__file__).parent.parent.parent
+        raw_rules = custom_cfg.get("rules_dir", "rules/custom")
+        if Path(raw_rules).is_absolute():
+            candidate = Path(raw_rules).resolve()
+        else:
+            candidate = (base / raw_rules).resolve()
+            if not candidate.is_relative_to(base.resolve()):
+                logger.error(f"Custom rules_dir escapes package root: {raw_rules}")
+                self.enabled = False
+                candidate = base / "rules" / "custom"
+        self.rules_dir = candidate
         self._rules: list[dict] = []
         if self.enabled:
             self._load_rules()
@@ -111,9 +119,17 @@ class CustomRulesEngine:
 
     @staticmethod
     def _match(conditions: dict, event: dict) -> bool:
-        """Check if all conditions match the event (substring matching)."""
+        """Check if all conditions match the event (substring matching).
+
+        Only scalar event values (str, int, float, bool, None) are compared.
+        Structured values (list, dict) are skipped to avoid misleading
+        matches against Python repr output.
+        """
         for field, pattern in conditions.items():
-            value = str(event.get(field, ""))
+            raw = event.get(field, "")
+            if isinstance(raw, (list, dict)):
+                return False  # Cannot meaningfully substring-match containers
+            value = str(raw)
             if str(pattern).lower() not in value.lower():
                 return False
         return True

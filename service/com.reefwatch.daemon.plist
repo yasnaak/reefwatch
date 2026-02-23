@@ -5,11 +5,12 @@
     <key>Label</key>
     <string>com.reefwatch.daemon</string>
 
+    <!-- Use the 'reefwatch' console_script entry point (pip install -e .).
+         If installed in a virtualenv, update the path below, e.g.:
+         /Users/YOU/.venv/bin/reefwatch -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>-m</string>
-        <string>reefwatch.daemon</string>
+        <string>/usr/local/bin/reefwatch</string>
         <string>--config</string>
         <string>~/.openclaw/workspace/skills/reefwatch/scripts/reefwatch_config.yaml</string>
     </array>
@@ -24,10 +25,10 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/tmp/reefwatch.stdout.log</string>
+    <string>~/Library/Logs/reefwatch.stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/reefwatch.stderr.log</string>
+    <string>~/Library/Logs/reefwatch.stderr.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

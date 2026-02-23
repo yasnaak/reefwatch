@@ -5,7 +5,7 @@ import time
 from reefwatch.engines.yara_engine import YaraEngine
 
 
-def _make_config(enabled=False, mode="realtime", interval_hours=24):
+def _make_config(enabled=False, mode="on_change", interval_hours=24):
     return {
         "engines": {
             "yara": {
@@ -26,12 +26,12 @@ class TestYaraScheduled:
         assert engine.mode == "scheduled"
         assert engine.scheduled_interval == 12 * 3600
 
-    def test_realtime_mode_default(self):
+    def test_on_change_mode_default(self):
         engine = YaraEngine(_make_config())
-        assert engine.mode == "realtime"
+        assert engine.mode == "on_change"
 
-    def test_should_run_scheduled_scan_false_for_realtime(self):
-        engine = YaraEngine(_make_config(mode="realtime"))
+    def test_should_run_scheduled_scan_false_for_on_change(self):
+        engine = YaraEngine(_make_config(mode="on_change"))
         assert engine.should_run_scheduled_scan() is False
 
     def test_should_run_scheduled_scan_false_when_disabled(self):

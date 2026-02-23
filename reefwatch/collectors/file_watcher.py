@@ -39,7 +39,7 @@ class FileWatcher:
     def _hash_file(path: Path, max_bytes: int) -> str:
         """Compute SHA256 for files under the size threshold, else return empty."""
         try:
-            if path.stat().st_size > max_bytes:
+            if path.is_symlink() or path.stat().st_size > max_bytes:
                 return ""
             h = hashlib.sha256()
             with open(path, "rb") as fh:
@@ -51,7 +51,7 @@ class FileWatcher:
 
     def _take_snapshot(self):
         for wp in self.watched_paths:
-            if not wp.exists():
+            if not wp.exists() or wp.is_symlink():
                 continue
             if wp.is_file():
                 try:
@@ -76,10 +76,10 @@ class FileWatcher:
         if not force and cached is not None and dir_mtime == cached:
             # Dir structure unchanged (no creates/deletes) — skip iterdir().
             # Re-stat known files to detect content modifications.
-            d_str = str(d)
+            # Compare Path objects to avoid trailing-slash mismatches.
             for path in list(self._snapshots.keys()):
                 p = Path(path)
-                if str(p.parent) != d_str:
+                if p.parent != d:
                     continue
                 if p.is_file():
                     try:
@@ -91,11 +91,13 @@ class FileWatcher:
             # Recurse into known subdirectories
             for sub_d in list(self._dir_mtimes.keys()):
                 sub_p = Path(sub_d)
-                if str(sub_p.parent) == d_str and sub_p.is_dir():
+                if sub_p.parent == d and sub_p.is_dir():
                     self._scan_directory(sub_p, current)
             return
 
         for child in d.iterdir():
+            if child.is_symlink():
+                continue
             if child.is_file():
                 try:
                     st = child.stat()
@@ -112,7 +114,7 @@ class FileWatcher:
         current: dict[str, tuple[float, int, str]] = {}
 
         for wp in self.watched_paths:
-            if not wp.exists():
+            if not wp.exists() or wp.is_symlink():
                 continue
             if wp.is_file():
                 try:

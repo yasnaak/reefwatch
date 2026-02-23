@@ -6,12 +6,16 @@ Monitors network connections for suspicious activity.
 
 import ipaddress
 import socket
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 from pathlib import Path
 
 import psutil
 
 from reefwatch._common import logger
+
+# Default socket timeout for reverse DNS (prevents blocking)
+_DNS_TIMEOUT = 2.0
 
 
 class NetworkMonitor:
@@ -27,6 +31,14 @@ class NetworkMonitor:
         self._ioc_ips: set[str] = set()
         self._ioc_domains: set[str] = set()
 
+        # DNS reverse-lookup cache: ip -> (hostname | None)
+        self._dns_cache: dict[str, str | None] = {}
+        self._max_dns_cache = 5_000
+        self._max_rdns_per_cycle = 20  # Cap reverse lookups per check()
+        self._rdns_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rdns"
+        )
+
         # Load IOC blocklist
         ioc_path = net_cfg.get("ioc_blocklist", "")
         if ioc_path:
@@ -40,7 +52,8 @@ class NetworkMonitor:
     def _load_iocs(self, path: str):
         p = Path(path)
         if not p.is_absolute():
-            p = Path(__file__).parent / p
+            # Resolve relative to project root (same convention as engines)
+            p = Path(__file__).parent.parent.parent / p
         if not p.exists():
             logger.warning(f"IOC blocklist not found: {p}")
             return
@@ -66,6 +79,24 @@ class NetworkMonitor:
             f"{len(self._ioc_domains)} domains"
         )
 
+    def _reverse_dns(self, ip: str) -> str | None:
+        """Cached reverse DNS lookup with timeout (thread-safe, no global state)."""
+        if ip in self._dns_cache:
+            return self._dns_cache[ip]
+        try:
+            future = self._rdns_executor.submit(socket.gethostbyaddr, ip)
+            hostname, _, _ = future.result(timeout=_DNS_TIMEOUT)
+            self._dns_cache[ip] = hostname.lower() if hostname else None
+        except (FuturesTimeout, socket.herror, socket.gaierror, OSError):
+            self._dns_cache[ip] = None
+        # Evict oldest if cache too large
+        if len(self._dns_cache) > self._max_dns_cache:
+            # Remove first 20% of entries (insertion order in Python 3.7+)
+            evict = len(self._dns_cache) // 5
+            for k in list(self._dns_cache)[:evict]:
+                del self._dns_cache[k]
+        return self._dns_cache.get(ip)
+
     def check(self) -> list[dict]:
         alerts = []
         try:
@@ -79,7 +110,27 @@ class NetworkMonitor:
                 return alerts
 
         current_conns = set()
+        rdns_count = 0
+
         for conn in connections:
+            # Detect LISTEN sockets on suspicious ports
+            if conn.status == "LISTEN" and conn.laddr:
+                local_port = conn.laddr.port
+                if local_port in self.suspicious_ports:
+                    alerts.append(
+                        {
+                            "type": "Listening on suspicious port",
+                            "severity": "HIGH",
+                            "source": "network_monitor",
+                            "detail": (
+                                f"LISTEN on {conn.laddr.ip}:{local_port} "
+                                f"(PID: {conn.pid})"
+                            ),
+                            "rule": f"custom/suspicious_listen/{local_port}",
+                            "time": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+
             if conn.status == "ESTABLISHED" and conn.raddr:
                 remote_ip = conn.raddr.ip
                 remote_port = conn.raddr.port
@@ -101,7 +152,7 @@ class NetworkMonitor:
                         }
                     )
 
-                # Check IOC blocklist
+                # Check IOC blocklist (IPs)
                 if remote_ip in self._ioc_ips:
                     alerts.append(
                         {
@@ -117,15 +168,43 @@ class NetworkMonitor:
                         }
                     )
 
-        # Check connection rate (new connections since last check)
+                # Reverse-DNS check against IOC domains (with cache + cap)
+                if (
+                    self._ioc_domains
+                    and remote_ip not in self._ioc_ips
+                    and rdns_count < self._max_rdns_per_cycle
+                ):
+                    rdns_count += 1
+                    hostname = self._reverse_dns(remote_ip)
+                    if hostname and hostname in self._ioc_domains:
+                        alerts.append(
+                            {
+                                "type": "Connection to known malicious domain",
+                                "severity": "CRITICAL",
+                                "source": "network_monitor",
+                                "detail": (
+                                    f"Connection to IOC domain "
+                                    f"{hostname} ({remote_ip}:{remote_port}) "
+                                    f"(PID: {conn.pid})"
+                                ),
+                                "rule": "custom/ioc_domain",
+                                "time": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+
+        # Check connection rate (normalized to per-minute)
         new_conns = current_conns - self._prev_connections
-        if len(new_conns) > self.rate_threshold:
+        rate_per_minute = len(new_conns) * 60 / max(self.interval, 1)
+        if rate_per_minute > self.rate_threshold:
             alerts.append(
                 {
                     "type": "High connection rate",
                     "severity": "MEDIUM",
                     "source": "network_monitor",
-                    "detail": f"{len(new_conns)} new connections since last check",
+                    "detail": (
+                        f"{len(new_conns)} new connections in {self.interval}s "
+                        f"({rate_per_minute:.0f}/min)"
+                    ),
                     "rule": "custom/connection_rate",
                     "time": datetime.now(timezone.utc).isoformat(),
                 }
@@ -133,3 +212,7 @@ class NetworkMonitor:
 
         self._prev_connections = current_conns
         return alerts
+
+    def shutdown(self):
+        """Release the reverse-DNS thread pool."""
+        self._rdns_executor.shutdown(wait=False)

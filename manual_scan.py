@@ -6,6 +6,7 @@ On-demand YARA scan of a specific file or directory.
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,10 +57,12 @@ def main():
 
     # Collect files to scan
     max_size = args.max_size_mb * 1024 * 1024
-    if target.is_file():
+    if target.is_file() and not target.is_symlink():
         files = [target]
+    elif target.is_file():
+        files = []  # Skip symlink targets
     else:
-        files = [f for f in target.rglob("*") if f.is_file()]
+        files = [f for f in target.rglob("*") if f.is_file() and not f.is_symlink()]
 
     scanned = 0
     findings = []
@@ -81,14 +84,15 @@ def main():
                         "time": datetime.now(timezone.utc).isoformat(),
                     }
                     findings.append(finding)
-                    severity = finding["meta"].get("severity", "HIGH")
-                    print(f"  🔴 MATCH: {m.rule}")
-                    print(f"     File: {f}")
-                    print(f"     Tags: {', '.join(m.tags) if m.tags else 'none'}")
-                    print(f"     Severity: {severity}")
-                    print()
+                    if not args.json:
+                        severity = finding["meta"].get("severity", "HIGH")
+                        print(f"  🔴 MATCH: {m.rule}")
+                        print(f"     File: {f}")
+                        print(f"     Tags: {', '.join(m.tags) if m.tags else 'none'}")
+                        print(f"     Severity: {severity}")
+                        print()
 
-            if scanned % 100 == 0:
+            if not args.json and scanned % 100 == 0:
                 print(f"  ... scanned {scanned} files", end="\r")
 
         except Exception as e:
@@ -112,8 +116,12 @@ def main():
     if findings:
         print(f"\n{len(findings)} threats detected!")
         report_path = Path(__file__).parent / "manual_scan_report.json"
-        with open(report_path, "w") as f:
-            json.dump(findings, f, indent=2)
+        report_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, "O_NOFOLLOW"):
+            report_flags |= os.O_NOFOLLOW
+        fd = os.open(str(report_path), report_flags, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(findings, fh, indent=2)
         print(f"   Report saved to: {report_path}")
         sys.exit(1)
     else:
