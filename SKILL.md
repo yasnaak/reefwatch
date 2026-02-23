@@ -1,12 +1,12 @@
 ---
 name: reefwatch
-version: 1.1.0
+version: 1.2.0
 description: "Continuous local security monitoring daemon for Linux and macOS. Detects brute-force attacks, malware, privilege escalation, suspicious processes, file tampering, cryptominers, and network anomalies using YARA, Sigma, and custom detection rules. Runs as a background process and alerts only when real threats are found. Use when the user wants host-level intrusion detection, security monitoring, threat scanning, or asks about suspicious activity on their machine."
 metadata:
   openclaw:
     requires:
       bins: ["python3", "pip3"]
-      env: []
+      env: ["OPENCLAW_HOOKS_TOKEN"]
     os: ["linux", "darwin"]
 ---
 
@@ -34,20 +34,20 @@ When the user asks to start ReefWatch or enable security monitoring:
 
 1. Verify dependencies are installed:
    ```bash
-   cd ~/.openclaw/workspace/skills/reefwatch/scripts && pip3 install -r requirements.txt --break-system-packages --quiet
+   pip3 install -r ~/.openclaw/workspace/skills/reefwatch/requirements.txt --quiet
    ```
 
 2. Download initial rulesets (first time only):
    ```bash
-   python3 ~/.openclaw/workspace/skills/reefwatch/scripts/setup_rules.py
+   python3 ~/.openclaw/workspace/skills/reefwatch/setup_rules.py
    ```
 
 3. Start the daemon:
    ```bash
-   nohup python3 ~/.openclaw/workspace/skills/reefwatch/scripts/reefwatch_daemon.py \
+   nohup python3 ~/.openclaw/workspace/skills/reefwatch/reefwatch_daemon.py \
      --webhook-url "http://127.0.0.1:18789/hooks/wake" \
      --webhook-token "${OPENCLAW_HOOKS_TOKEN}" \
-     --config ~/.openclaw/workspace/skills/reefwatch/scripts/reefwatch_config.yaml \
+     --config ~/.openclaw/workspace/skills/reefwatch/reefwatch_config.yaml \
      > ~/.openclaw/logs/reefwatch.log 2>&1 &
    echo $! > /tmp/reefwatch.pid
    ```
@@ -72,18 +72,18 @@ fi
 
 ### View recent alerts
 ```bash
-tail -20 ~/.openclaw/workspace/skills/reefwatch/scripts/alert_history.jsonl | python3 -c "import sys,json; [print(json.dumps(json.loads(l),indent=2)) for l in sys.stdin]"
+tail -20 ~/.openclaw/workspace/skills/reefwatch/alert_history.jsonl | python3 -c "import sys,json; [print(json.dumps(json.loads(l),indent=2)) for l in sys.stdin]"
 ```
 
 ### Update rules
 ```bash
-python3 ~/.openclaw/workspace/skills/reefwatch/scripts/setup_rules.py --update
+python3 ~/.openclaw/workspace/skills/reefwatch/setup_rules.py --update
 ```
 
 ### Run manual scan
 When the user asks to scan a specific file or directory:
 ```bash
-python3 ~/.openclaw/workspace/skills/reefwatch/scripts/manual_scan.py --target <path>
+python3 ~/.openclaw/workspace/skills/reefwatch/manual_scan.py --target <path>
 ```
 
 ## Alert Format
