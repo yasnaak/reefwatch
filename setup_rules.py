@@ -100,7 +100,10 @@ INITIAL_IOC_BLOCKLIST = """# ReefWatch IOC Blocklist
 
 def _write_restricted(path: Path, content: str):
     """Write a file with 0o600 permissions (owner-only read/write)."""
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(path), flags, 0o600)
     try:
         os.write(fd, content.encode())
     finally:
@@ -141,6 +144,21 @@ def download_rules(sources: list[dict], target_dir: Path, rule_type: str):
             if not run_cmd(clone_cmd):
                 print(f"  ❌ Failed to clone {source['name']}, skipping")
                 continue
+
+            # Verify commit SHA if pinned (tags can be moved by repo owners)
+            expected_sha = source.get("commit_sha")
+            if expected_sha:
+                result = subprocess.run(
+                    ["git", "-C", tmpdir, "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                actual_sha = result.stdout.strip()
+                if actual_sha != expected_sha:
+                    print(
+                        f"  ❌ SHA mismatch for {source['name']}: "
+                        f"expected {expected_sha[:12]}, got {actual_sha[:12]}"
+                    )
+                    continue
 
             copied = 0
             for rel_path in source["paths"]:
@@ -328,7 +346,7 @@ def create_sample_yara_rules():
 
     fallback = yara_dir / "reefwatch_basics.yar"
     if not fallback.exists():
-        fallback.write_text(
+        _write_restricted(fallback,
             """
 rule ReefWatch_CryptoMiner_Strings
 {

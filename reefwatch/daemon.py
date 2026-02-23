@@ -104,14 +104,14 @@ class ReefWatchDaemon:
             try:
                 self._cycle(cycle)
                 cycle += 1
-                time.sleep(
-                    self.config.get("collectors", {})
+                RUNNING.wait(
+                    timeout=self.config.get("collectors", {})
                     .get("logs", {})
                     .get("interval_seconds", 10)
                 )
             except Exception as e:
                 logger.error(f"Error in monitoring cycle: {e}", exc_info=True)
-                time.sleep(5)  # Back off on errors
+                RUNNING.wait(timeout=5)  # Back off on errors
 
         self.alert_mgr.shutdown()
         self.network_monitor.shutdown()
@@ -270,7 +270,7 @@ def main():
     parser = argparse.ArgumentParser(description="ReefWatch Security Daemon")
     parser.add_argument(
         "--config",
-        default="~/.openclaw/workspace/skills/reefwatch/scripts/reefwatch_config.yaml",
+        default="~/.openclaw/workspace/skills/reefwatch/reefwatch_config.yaml",
         help="Path to config file",
     )
     parser.add_argument("--webhook-url", help="OpenClaw webhook URL")

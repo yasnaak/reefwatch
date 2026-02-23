@@ -5,7 +5,7 @@ Documentation=https://github.com/yasnaak/reefwatch
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m reefwatch.daemon --config %h/.openclaw/workspace/skills/reefwatch/scripts/reefwatch_config.yaml
+ExecStart=/usr/bin/python3 -m reefwatch.daemon --config %h/.openclaw/workspace/skills/reefwatch/reefwatch_config.yaml
 Restart=on-failure
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
@@ -16,6 +16,16 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.openclaw %t
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateDevices=true
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=default.target

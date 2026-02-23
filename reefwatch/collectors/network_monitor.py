@@ -97,6 +97,16 @@ class NetworkMonitor:
                 del self._dns_cache[k]
         return self._dns_cache.get(ip)
 
+    def _is_ioc_domain(self, hostname: str) -> bool:
+        """Check if hostname matches an IOC domain or is a subdomain of one."""
+        hostname = hostname.lower()
+        if hostname in self._ioc_domains:
+            return True
+        for ioc_domain in self._ioc_domains:
+            if hostname.endswith("." + ioc_domain):
+                return True
+        return False
+
     def check(self) -> list[dict]:
         alerts = []
         try:
@@ -176,7 +186,7 @@ class NetworkMonitor:
                 ):
                     rdns_count += 1
                     hostname = self._reverse_dns(remote_ip)
-                    if hostname and hostname in self._ioc_domains:
+                    if hostname and self._is_ioc_domain(hostname):
                         alerts.append(
                             {
                                 "type": "Connection to known malicious domain",

@@ -12,7 +12,7 @@
     <array>
         <string>/usr/local/bin/reefwatch</string>
         <string>--config</string>
-        <string>~/.openclaw/workspace/skills/reefwatch/scripts/reefwatch_config.yaml</string>
+        <string>~/.openclaw/workspace/skills/reefwatch/reefwatch_config.yaml</string>
     </array>
 
     <key>RunAtLoad</key>

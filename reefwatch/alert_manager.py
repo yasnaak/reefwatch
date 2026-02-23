@@ -4,6 +4,7 @@ reefwatch.alert_manager
 Deduplicates, batches, and delivers alerts to OpenClaw webhook.
 """
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -82,7 +83,6 @@ class AlertManager:
 
         # Dedup key includes rule + hash of detail to avoid collisions
         # on long paths sharing a prefix
-        import hashlib
         detail_hash = hashlib.md5(
             alert.get("detail", "").encode(), usedforsecurity=False
         ).hexdigest()[:16]
@@ -172,7 +172,8 @@ class AlertManager:
                 logger.warning(f"Webhook returned {resp.status_code}: {resp.text}")
             except Exception as e:
                 logger.warning(f"Webhook attempt {attempt+1} failed: {e}")
-            time.sleep(retry["delay"])
+            if attempt < retry["attempts"] - 1:
+                time.sleep(retry["delay"])
 
         logger.error("Failed to deliver alert after retries")
 
@@ -258,9 +259,11 @@ class AlertManager:
         if resolved_ip and resolved_ip != hostname:
             # Rewrite URL to use resolved IP, keep original host for Host header
             self._webhook_host_header = hostname
+            # IPv6 literals must be bracketed in URLs (RFC 2732)
+            ip_str = f"[{resolved_ip}]" if ":" in resolved_ip else resolved_ip
             port = f":{parsed.port}" if parsed.port else ""
             self.webhook_url = (
-                f"{parsed.scheme}://{resolved_ip}{port}{parsed.path}"
+                f"{parsed.scheme}://{ip_str}{port}{parsed.path}"
                 + (f"?{parsed.query}" if parsed.query else "")
             )
 
@@ -319,6 +322,7 @@ class AlertManager:
                 os.close(fd)
                 fd = -1
                 os.replace(tmp_path, str(self.history_file))
+                self._history_count = min(len(lines), self.max_history)
                 tmp_path = None
             except Exception:
                 if fd >= 0:

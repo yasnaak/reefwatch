@@ -1,6 +1,6 @@
 ---
 name: reefwatch
-version: 1.2.0
+version: 1.3.0
 description: "Continuous local security monitoring daemon for Linux and macOS. Detects brute-force attacks, malware, privilege escalation, suspicious processes, file tampering, cryptominers, and network anomalies using YARA, Sigma, and custom detection rules. Runs as a background process and alerts only when real threats are found. Use when the user wants host-level intrusion detection, security monitoring, threat scanning, or asks about suspicious activity on their machine."
 metadata:
   openclaw:

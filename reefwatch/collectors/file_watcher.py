@@ -95,7 +95,12 @@ class FileWatcher:
                     self._scan_directory(sub_p, current)
             return
 
-        for child in d.iterdir():
+        try:
+            children = list(d.iterdir())
+        except (PermissionError, OSError) as e:
+            logger.debug(f"Cannot iterate {d}: {e}")
+            return
+        for child in children:
             if child.is_symlink():
                 continue
             if child.is_file():

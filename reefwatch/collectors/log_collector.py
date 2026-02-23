@@ -6,7 +6,7 @@ Tails system log files for new entries.
 
 import json
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from reefwatch._common import SYSTEM, expand, get_os_key, logger
 
@@ -158,11 +158,33 @@ class LogCollector:
                     continue
 
             # Update timestamp for next collection (local time for journalctl).
-            # Add 1 second because --since is inclusive — avoids re-processing
-            # the last event from the previous cycle.
-            self._last_journald_ts = (
-                datetime.now() + timedelta(seconds=1)
-            ).strftime("%Y-%m-%d %H:%M:%S")
+            # Use the last event's real timestamp + 1µs to avoid the 1-second
+            # gap that could miss events.  Fall back to now() if no events.
+            if entries:
+                last_rt = None
+                for line in reversed(result.stdout.strip().split("\n")):
+                    try:
+                        last_rt = int(json.loads(line).get("__REALTIME_TIMESTAMP", 0))
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        continue
+                    if last_rt:
+                        break
+                if last_rt:
+                    last_dt = datetime.fromtimestamp(
+                        (last_rt + 1) / 1_000_000
+                    )
+                    self._last_journald_ts = last_dt.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                else:
+                    self._last_journald_ts = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+            else:
+                # No events — advance to now so next poll starts fresh
+                self._last_journald_ts = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
         except FileNotFoundError:
             logger.debug("journalctl not found, disabling journald collection")
             self.use_journald = False
